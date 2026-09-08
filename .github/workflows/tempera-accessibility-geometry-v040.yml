@@ -4,10 +4,11 @@ on:
   push:
     branches:
       - tempera/accessibility-geometry-v040-min
+      - tempera/accessibility-geometry-v040-pinned
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   backport-check:
@@ -17,33 +18,56 @@ jobs:
       CARGO_INCREMENTAL: "0"
       CARGO_TERM_COLOR: always
       SERVO_V040_BASE: e8dbc1dfbf6f58621346a5f61ab7a17d01387873
+      AUDIT_BRANCH: tempera/accessibility-geometry-v040-min
+      PINNED_BRANCH: tempera/accessibility-geometry-v040-pinned
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@1.96.1
-      - name: Verify audit branch shape
+      - name: Verify branch shape
         shell: bash
         run: |
           set -euo pipefail
           git cat-file -e "$SERVO_V040_BASE^{commit}"
           mapfile -t changed < <(git diff --name-only "$SERVO_V040_BASE"...HEAD | sort)
           printf '%s\n' "${changed[@]}"
-          expected=(
-            .github/workflows/tempera-accessibility-geometry-v040.yml
-            tempera/patches/servo-v0.4-accessibility-geometry.patch
-          )
+          if [[ "$GITHUB_REF_NAME" == "$AUDIT_BRANCH" ]]; then
+            expected=(
+              .github/workflows/tempera-accessibility-geometry-v040.yml
+              tempera/patches/servo-v0.4-accessibility-geometry.patch
+            )
+            git diff --exit-code "$SERVO_V040_BASE" -- components/layout/accessibility_tree.rs components/layout/layout_impl.rs
+          elif [[ "$GITHUB_REF_NAME" == "$PINNED_BRANCH" ]]; then
+            expected=(
+              .github/workflows/tempera-accessibility-geometry-v040.yml
+              components/layout/accessibility_tree.rs
+              components/layout/layout_impl.rs
+              tempera/patches/servo-v0.4-accessibility-geometry.patch
+            )
+          else
+            echo "unexpected branch: $GITHUB_REF_NAME" >&2
+            exit 2
+          fi
           mapfile -t expected_sorted < <(printf '%s\n' "${expected[@]}" | sort)
           test "${#changed[@]}" -eq "${#expected_sorted[@]}"
           diff -u <(printf '%s\n' "${expected_sorted[@]}") <(printf '%s\n' "${changed[@]}")
-          git diff --exit-code "$SERVO_V040_BASE" -- components/layout/accessibility_tree.rs components/layout/layout_impl.rs
       - name: Apply minimal geometry backport
+        if: github.ref_name == 'tempera/accessibility-geometry-v040-min'
         shell: bash
         run: |
           set -euo pipefail
           python3 tempera/patches/servo-v0.4-accessibility-geometry.patch
           git diff --check
-          mapfile -t product_changed < <(git diff --name-only | sort)
+      - name: Verify geometry product scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_NAME" == "$AUDIT_BRANCH" ]]; then
+            mapfile -t product_changed < <(git diff --name-only | sort)
+          else
+            mapfile -t product_changed < <(git diff --name-only "$SERVO_V040_BASE"...HEAD -- components/layout/accessibility_tree.rs components/layout/layout_impl.rs | sort)
+          fi
           expected_product=(
             components/layout/accessibility_tree.rs
             components/layout/layout_impl.rs
@@ -64,19 +88,33 @@ jobs:
           sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/microsoft-prod.sources
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends pkg-config libfontconfig1-dev llvm
-      - name: Check patched Servo package
+      - name: Check geometry-capable Servo package
         shell: bash
         run: |
           set -euo pipefail
           cargo check -p servo --no-default-features
+      - name: Publish immutable-source candidate branch
+        if: success() && github.ref_name == 'tempera/accessibility-geometry-v040-min'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add components/layout/accessibility_tree.rs components/layout/layout_impl.rs
+          git commit -m 'Backport accessibility geometry to Servo 0.4'
+          candidate_sha="$(git rev-parse HEAD)"
+          git push --force origin "HEAD:refs/heads/$PINNED_BRANCH"
+          echo "candidate_sha=$candidate_sha" >> "$GITHUB_ENV"
       - name: Write audit receipt
         if: success()
         shell: bash
         run: |
           mkdir -p tempera/receipts
           transform_sha="$(sha256sum tempera/patches/servo-v0.4-accessibility-geometry.patch | awk '{print $1}')"
-          printf '{"schema":1,"servoBase":"%s","auditHead":"%s","transformSha256":"%s","scope":["components/layout/accessibility_tree.rs","components/layout/layout_impl.rs"],"cargoCheck":true,"promotionClass":"geometry-backport-candidate"}\n' \
-            "$SERVO_V040_BASE" "$GITHUB_SHA" "$transform_sha" | tee tempera/receipts/accessibility-geometry-v040.json
+          candidate_sha="${candidate_sha:-$GITHUB_SHA}"
+          printf '{"schema":2,"servoBase":"%s","auditHead":"%s","candidateHead":"%s","transformSha256":"%s","scope":["components/layout/accessibility_tree.rs","components/layout/layout_impl.rs"],"cargoCheck":true,"sourceCommitted":%s,"promotionClass":"geometry-backport-candidate"}\n' \
+            "$SERVO_V040_BASE" "$GITHUB_SHA" "$candidate_sha" "$transform_sha" \
+            "$([[ "$GITHUB_REF_NAME" == "$PINNED_BRANCH" ]] && echo true || echo false)" | tee tempera/receipts/accessibility-geometry-v040.json
       - name: Upload audit receipt
         if: always()
         uses: actions/upload-artifact@v4
