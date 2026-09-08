@@ -105,6 +105,30 @@ jobs:
           candidate_sha="$(git rev-parse HEAD)"
           git push --force origin "HEAD:refs/heads/$PINNED_BRANCH"
           echo "candidate_sha=$candidate_sha" >> "$GITHUB_ENV"
+      - name: Revalidate immutable candidate source
+        if: success() && github.ref_name == 'tempera/accessibility-geometry-v040-min'
+        shell: bash
+        run: |
+          set -euo pipefail
+          candidate_sha="${candidate_sha:?candidate SHA missing}"
+          test "$(git rev-parse HEAD)" = "$candidate_sha"
+          test -z "$(git status --porcelain --untracked-files=no)"
+          mapfile -t changed < <(git diff --name-only "$SERVO_V040_BASE"...HEAD | sort)
+          expected=(
+            .github/workflows/tempera-accessibility-geometry-v040.yml
+            components/layout/accessibility_tree.rs
+            components/layout/layout_impl.rs
+            tempera/patches/servo-v0.4-accessibility-geometry.patch
+          )
+          mapfile -t expected_sorted < <(printf '%s\n' "${expected[@]}" | sort)
+          test "${#changed[@]}" -eq "${#expected_sorted[@]}"
+          diff -u <(printf '%s\n' "${expected_sorted[@]}") <(printf '%s\n' "${changed[@]}")
+          git diff --check "$SERVO_V040_BASE"...HEAD
+          grep -n 'update_bounds_from_dom_node' components/layout/accessibility_tree.rs
+          grep -n 'BoxAreaType::Border' components/layout/accessibility_tree.rs
+          grep -n 'set_needs_accessibility_update' components/layout/layout_impl.rs
+          cargo check -p servo --no-default-features
+          echo "SOURCE_COMMITTED=true" >> "$GITHUB_ENV"
       - name: Write audit receipt
         if: success()
         shell: bash
@@ -112,9 +136,12 @@ jobs:
           mkdir -p tempera/receipts
           transform_sha="$(sha256sum tempera/patches/servo-v0.4-accessibility-geometry.patch | awk '{print $1}')"
           candidate_sha="${candidate_sha:-$GITHUB_SHA}"
-          printf '{"schema":2,"servoBase":"%s","auditHead":"%s","candidateHead":"%s","transformSha256":"%s","scope":["components/layout/accessibility_tree.rs","components/layout/layout_impl.rs"],"cargoCheck":true,"sourceCommitted":%s,"promotionClass":"geometry-backport-candidate"}\n' \
-            "$SERVO_V040_BASE" "$GITHUB_SHA" "$candidate_sha" "$transform_sha" \
-            "$([[ "$GITHUB_REF_NAME" == "$PINNED_BRANCH" ]] && echo true || echo false)" | tee tempera/receipts/accessibility-geometry-v040.json
+          source_committed=false
+          if [[ "$GITHUB_REF_NAME" == "$PINNED_BRANCH" || "${SOURCE_COMMITTED:-false}" == "true" ]]; then
+            source_committed=true
+          fi
+          printf '{"schema":3,"servoBase":"%s","auditHead":"%s","candidateHead":"%s","transformSha256":"%s","scope":["components/layout/accessibility_tree.rs","components/layout/layout_impl.rs"],"cargoCheck":true,"sourceCommitted":%s,"promotionClass":"geometry-backport-candidate"}\n' \
+            "$SERVO_V040_BASE" "$GITHUB_SHA" "$candidate_sha" "$transform_sha" "$source_committed" | tee tempera/receipts/accessibility-geometry-v040.json
       - name: Upload audit receipt
         if: always()
         uses: actions/upload-artifact@v4
