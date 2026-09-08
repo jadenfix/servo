@@ -83,7 +83,7 @@ use url::Url;
 use webrender_api::ExternalScrollId;
 use webrender_api::units::{DevicePixel, LayoutVector2D};
 
-use crate::accessibility_tree::AccessibilityTree;
+use crate::accessibility_tree::{AccessibilityContext, AccessibilityTree};
 use crate::context::{CachedImageOrError, ImageResolver, LayoutContext};
 use crate::display_list::{DisplayListBuilder, HitTest, PaintTimingHandler, StackingContextTree};
 use crate::dom::NodeExt;
@@ -727,6 +727,12 @@ impl Layout for LayoutThread {
             .paint_info
             .scroll_tree
             .set_all_scroll_offsets(scroll_states);
+
+        // Bounds are viewport-relative, so renderer scroll invalidates cached accessibility
+        // geometry without requiring DOM damage.
+        if self.accessibility_active() {
+            self.set_needs_accessibility_update();
+        }
     }
 
     fn scroll_offset(&self, id: ExternalScrollId) -> Option<LayoutVector2D> {
@@ -969,7 +975,9 @@ impl LayoutThread {
         root_element: &ServoLayoutNode,
         reflow_request: &mut ReflowRequest,
     ) -> bool {
-        if !self.needs_accessibility_update() {
+        if reflow_request.reflow_goal != ReflowGoal::UpdateTheRendering ||
+            !self.accessibility_active()
+        {
             return false;
         }
         let mut accessibility_tree = self.accessibility_tree.borrow_mut();
@@ -978,10 +986,21 @@ impl LayoutThread {
         };
 
         let accessibility_tree = &mut *accessibility_tree;
+
+        // Bounds use the current stacking/scroll tree. Preserve rooted integrity state if geometry
+        // is unexpectedly unavailable so a later rendering update can retry fail-closed.
+        let stacking_context_tree = self.stacking_context_tree.borrow();
+        let Some(stacking_context_tree) = stacking_context_tree.as_ref() else {
+            return false;
+        };
         let rooted_nodes =
             std::mem::take(&mut reflow_request.rooted_nodes_for_accessibility_integrity_check);
+        let context = AccessibilityContext {
+            layout_thread: self,
+            stacking_context_tree,
+        };
 
-        if let Some(tree_update) = accessibility_tree.update_tree(root_element, rooted_nodes) {
+        if let Some(tree_update) = accessibility_tree.update_tree(root_element, context, rooted_nodes) {
             // FIXME: Handle send error. Could have a method on accessibility tree to
             // finalise after sending, removing accessibility damage? On fail, retain damage
             // for next reflow, as well as retaining document.needs_accessibility_update.
@@ -1528,6 +1547,10 @@ impl LayoutThread {
                 offset,
                 external_scroll_id,
             );
+            // Script scroll changes viewport-relative geometry without changing the DOM.
+            if self.accessibility_active() {
+                self.set_needs_accessibility_update();
+            }
             true
         } else {
             false

@@ -7,8 +7,10 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{LazyLock, atomic};
 
 use accesskit::{NodeId, Role};
+use app_units::Au;
 use bitflags::bitflags;
-use layout_api::{LayoutElement, LayoutNode, LayoutNodeType};
+use euclid::Rect;
+use layout_api::{BoxAreaType, LayoutElement, LayoutNode, LayoutNodeType};
 use log::trace;
 use rustc_hash::{FxHashMap, FxHashSet};
 use script::layout_dom::ServoLayoutNode;
@@ -17,9 +19,28 @@ use servo_base::print_tree::PrintTree;
 use servo_config::opts::{self, DiagnosticsLogging, DiagnosticsLoggingOption};
 use servo_config::pref;
 use style::dom::OpaqueNode;
+use style_traits::CSSPixel;
 use web_atoms::{LocalName, local_name};
 
 use crate::ArcRefCell;
+use crate::display_list::StackingContextTree;
+use crate::layout_impl::LayoutThread;
+use crate::query::process_box_area_request;
+
+/// Layout state needed to resolve accessibility nodes to viewport-relative CSS geometry.
+pub(super) struct AccessibilityContext<'a> {
+    pub(super) layout_thread: &'a LayoutThread,
+    pub(super) stacking_context_tree: &'a StackingContextTree,
+}
+
+fn au_rect_to_accesskit_rect(rect: Rect<Au, CSSPixel>) -> accesskit::Rect {
+    accesskit::Rect::new(
+        rect.min_x().to_f64_px(),
+        rect.min_y().to_f64_px(),
+        rect.max_x().to_f64_px(),
+        rect.max_y().to_f64_px(),
+    )
+}
 
 bitflags! {
     /// Damage which was caused by changes to the accessibility tree. These changes can cause other
@@ -151,13 +172,16 @@ impl AccessibilityTree {
     pub(super) fn update_tree(
         &mut self,
         root_dom_node: &ServoLayoutNode<'_>,
+        context: AccessibilityContext<'_>,
         rooted_nodes: Option<FxHashSet<OpaqueNode>>,
     ) -> Option<accesskit::TreeUpdate> {
         let mut update = AccessibilityUpdate::new(rooted_nodes);
         let (root_node_id, root_node) = self.get_or_create_node(root_dom_node, &mut update);
         self.root_node_id = Some(root_node_id);
 
-        self.update_node_and_descendants_from_dom_node(&root_node, root_dom_node, &mut update);
+        self.update_node_and_descendants_from_dom_node(
+            &root_node, root_dom_node, &context, &mut update,
+        );
 
         update.finalize(self)
     }
@@ -169,14 +193,18 @@ impl AccessibilityTree {
         &mut self,
         node: &ArcRefCell<AccessibilityNode>,
         dom_node: &ServoLayoutNode<'_>,
+        context: &AccessibilityContext<'_>,
         update: &mut AccessibilityUpdate,
     ) -> LocalAccessibilityDamage {
         let mut node = node.borrow_mut();
         let mut damage = LocalAccessibilityDamage::empty();
 
-        // TODO: read accessibility damage from DOM (right now, assume damage is complete)
+        // Servo 0.4 already walks the complete accessibility subtree on each requested update.
+        // Reuse that traversal to refresh transform-aware bounds without importing the broader
+        // post-0.5 accessibility damage machinery.
         damage.insert(node.update_node_from_dom_node(dom_node));
-        damage.insert(node.update_descendants_from_dom_node(dom_node, self, update));
+        node.update_bounds_from_dom_node(dom_node, context);
+        damage.insert(node.update_descendants_from_dom_node(dom_node, context, self, update));
 
         damage.insert(node.update_node_local(damage, self));
 
@@ -375,6 +403,7 @@ impl AccessibilityNode {
     fn update_descendants_from_dom_node<'dom>(
         &mut self,
         dom_node: &ServoLayoutNode<'dom>,
+        context: &AccessibilityContext<'_>,
         tree: &mut AccessibilityTree,
         update: &mut AccessibilityUpdate,
     ) -> LocalAccessibilityDamage {
@@ -391,8 +420,9 @@ impl AccessibilityNode {
         let mut damage_from_children = LocalAccessibilityDamage::empty();
         for dom_child in dom_children {
             let (_, child_node) = tree.get_or_create_node(&dom_child, update);
-            let child_damage =
-                tree.update_node_and_descendants_from_dom_node(&child_node, &dom_child, update);
+            let child_damage = tree.update_node_and_descendants_from_dom_node(
+                &child_node, &dom_child, context, update,
+            );
             damage_from_children.insert(child_damage);
         }
         if !damage_from_children.is_empty() {
@@ -450,6 +480,36 @@ impl AccessibilityNode {
         }
 
         damage
+    }
+
+    /// Resolve this DOM node's transform-aware border box into viewport-relative CSS pixels.
+    /// Nodes without their own layout box remain without bounds and are therefore not valid native
+    /// pointer targets. This follows Servo's existing getBoundingClientRect geometry path.
+    fn update_bounds_from_dom_node(
+        &mut self,
+        dom_node: &ServoLayoutNode<'_>,
+        context: &AccessibilityContext<'_>,
+    ) {
+        let bounds = process_box_area_request(
+            context.layout_thread,
+            context.stacking_context_tree,
+            *dom_node,
+            BoxAreaType::Border,
+            false,
+        )
+        .map(au_rect_to_accesskit_rect);
+
+        match bounds {
+            Some(bounds) if Some(bounds) != self.accesskit_node.bounds() => {
+                self.accesskit_node.set_bounds(bounds);
+                self.updated = true;
+            },
+            None if self.accesskit_node.bounds().is_some() => {
+                self.accesskit_node.clear_bounds();
+                self.updated = true;
+            },
+            _ => {},
+        }
     }
 
     /// Update this node's properties based on changes already made to the accessibility tree.
@@ -628,6 +688,9 @@ impl Debug for AccessibilityNode {
         }
         if let Some(label) = self.label() {
             write!(f, "\nlabel: {label:?}")?;
+        }
+        if let Some(bounds) = self.accesskit_node.bounds() {
+            write!(f, "\nbounds: {bounds:?}")?;
         }
         if !self.children().is_empty() {
             write!(f, "\nchildren: {:?}", self.children())?;
