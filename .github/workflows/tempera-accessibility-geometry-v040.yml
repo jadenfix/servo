@@ -41,9 +41,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git apply --check tempera/patches/servo-v0.4-accessibility-geometry.patch
-          git apply tempera/patches/servo-v0.4-accessibility-geometry.patch
+          python3 tempera/patches/servo-v0.4-accessibility-geometry.patch
           git diff --check
+          mapfile -t product_changed < <(git diff --name-only | sort)
+          expected_product=(
+            components/layout/accessibility_tree.rs
+            components/layout/layout_impl.rs
+          )
+          mapfile -t expected_product_sorted < <(printf '%s\n' "${expected_product[@]}" | sort)
+          diff -u <(printf '%s\n' "${expected_product_sorted[@]}") <(printf '%s\n' "${product_changed[@]}")
           grep -n 'update_bounds_from_dom_node' components/layout/accessibility_tree.rs
           grep -n 'BoxAreaType::Border' components/layout/accessibility_tree.rs
           grep -n 'set_needs_accessibility_update' components/layout/layout_impl.rs
@@ -68,9 +74,9 @@ jobs:
         shell: bash
         run: |
           mkdir -p tempera/receipts
-          patch_sha="$(sha256sum tempera/patches/servo-v0.4-accessibility-geometry.patch | awk '{print $1}')"
-          printf '{"schema":1,"servoBase":"%s","auditHead":"%s","patchSha256":"%s","scope":["components/layout/accessibility_tree.rs","components/layout/layout_impl.rs"],"cargoCheck":true,"promotionClass":"geometry-backport-candidate"}\n' \
-            "$SERVO_V040_BASE" "$GITHUB_SHA" "$patch_sha" | tee tempera/receipts/accessibility-geometry-v040.json
+          transform_sha="$(sha256sum tempera/patches/servo-v0.4-accessibility-geometry.patch | awk '{print $1}')"
+          printf '{"schema":1,"servoBase":"%s","auditHead":"%s","transformSha256":"%s","scope":["components/layout/accessibility_tree.rs","components/layout/layout_impl.rs"],"cargoCheck":true,"promotionClass":"geometry-backport-candidate"}\n' \
+            "$SERVO_V040_BASE" "$GITHUB_SHA" "$transform_sha" | tee tempera/receipts/accessibility-geometry-v040.json
       - name: Upload audit receipt
         if: always()
         uses: actions/upload-artifact@v4
